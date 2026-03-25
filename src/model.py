@@ -1,21 +1,15 @@
 """
-src/model.py
-------------
-Full encoder-decoder architecture implementing the three model variants
-compared in the paper (Tables 3–5):
+src/model.py  (v4 — added repetition penalty in generate())
 
-  1. Seq2Seq          — plain LSTM encoder-decoder, no attention
-  2. Attention        — LSTM encoder-decoder + Bahdanau attention
-  3. PTF + Attention  — Attention model + POS Tagging Feature in embedding (PROPOSED)
+Fix: repetition_penalty blocks tokens that appeared in the last N positions
+from being generated again. This prevents the ഒരു/ൽ repetition loop.
 """
 
-import os
-import torch
+import os, sys, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from src.attention import BahdanauAttention
@@ -23,8 +17,6 @@ from src.embedding import PTFEmbedding
 
 
 class Encoder(nn.Module):
-    """LSTM encoder (paper §3.3)."""
-
     def __init__(self, embed_dim, hidden_dim, num_layers=1, dropout=0.3):
         super().__init__()
         self.lstm = nn.LSTM(
@@ -39,19 +31,17 @@ class Encoder(nn.Module):
         packed = pack_padded_sequence(
             embedded, src_lengths.cpu(), batch_first=True, enforce_sorted=False
         )
-        packed_outputs, (hidden, cell) = self.lstm(packed)
-        encoder_outputs, _ = pad_packed_sequence(packed_outputs, batch_first=True)
+        packed_out, (hidden, cell) = self.lstm(packed)
+        encoder_outputs, _ = pad_packed_sequence(packed_out, batch_first=True)
         return encoder_outputs, hidden, cell
 
 
 class Decoder(nn.Module):
-    """LSTM decoder (paper §3.5)."""
-
     def __init__(self, vocab_size, embed_dim, hidden_dim,
                  num_layers=1, dropout=0.3, use_attention=True):
         super().__init__()
         self.use_attention = use_attention
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.embed   = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.dropout = nn.Dropout(dropout)
 
         if use_attention:
@@ -60,23 +50,22 @@ class Decoder(nn.Module):
         else:
             lstm_input_dim = embed_dim
 
-        self.lstm = nn.LSTM(
+        self.lstm   = nn.LSTM(
             input_size=lstm_input_dim, hidden_size=hidden_dim,
             num_layers=num_layers, batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc_out = nn.Linear(hidden_dim, vocab_size)
 
-    def forward_step(self, input_token, hidden, cell, encoder_outputs, src_mask=None):
-        input_token = input_token.unsqueeze(1)
-        embedded = self.dropout(self.embed(input_token))
+    def forward_step(self, input_token, hidden, cell,
+                     encoder_outputs, src_mask=None):
+        embedded = self.dropout(self.embed(input_token.unsqueeze(1)))
 
         attn_weights = None
         if self.use_attention:
             query = hidden[-1]
             context, attn_weights = self.attention(query, encoder_outputs, src_mask)
-            context = context.unsqueeze(1)
-            lstm_input = torch.cat([embedded, context], dim=-1)
+            lstm_input = torch.cat([embedded, context.unsqueeze(1)], dim=-1)
         else:
             lstm_input = embedded
 
@@ -86,17 +75,11 @@ class Decoder(nn.Module):
 
 
 class Seq2SeqModel(nn.Module):
-    """
-    Unified model supporting all three paper variants.
-      use_attention=False, use_pos=False  → Seq2Seq
-      use_attention=True,  use_pos=False  → Attention
-      use_attention=True,  use_pos=True   → PTF+Attention (proposed)
-    """
 
     def __init__(self, vocab_size, embedding_matrix,
                  use_attention=True, use_pos=True):
         super().__init__()
-        self.use_pos = use_pos
+        self.use_pos       = use_pos
         self.use_attention = use_attention
 
         self.ptf_embed = PTFEmbedding(
@@ -124,68 +107,87 @@ class Seq2SeqModel(nn.Module):
         self.enc2dec_c = nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM)
 
     def _init_decoder_state(self, enc_hidden, enc_cell):
-        """Paper Eq. (4): tanh projection of encoder final state."""
-        return torch.tanh(self.enc2dec_h(enc_hidden)), \
-               torch.tanh(self.enc2dec_c(enc_cell))
+        return (torch.tanh(self.enc2dec_h(enc_hidden)),
+                torch.tanh(self.enc2dec_c(enc_cell)))
+
+    def _make_src_mask(self, src_ids, enc_len):
+        """Trim mask to actual encoder output length (not MAX_INPUT_LEN)."""
+        return (src_ids[:, :enc_len] == 0)
 
     def forward(self, src_ids, src_pos, tgt_ids, src_lengths,
                 teacher_forcing_ratio=0.5):
         tgt_len = tgt_ids.size(1)
-        src_embedded = self.ptf_embed(src_ids, src_pos)
-        encoder_outputs, enc_hidden, enc_cell = self.encoder(src_embedded, src_lengths)
-        dec_hidden, dec_cell = self._init_decoder_state(enc_hidden, enc_cell)
-        src_mask = (src_ids == 0)
 
-        outputs = []
+        src_embedded = self.ptf_embed(src_ids, src_pos)
+        enc_out, enc_h, enc_c = self.encoder(src_embedded, src_lengths)
+        dec_h, dec_c = self._init_decoder_state(enc_h, enc_c)
+        src_mask     = self._make_src_mask(src_ids, enc_out.size(1))
+
+        outputs   = []
         dec_input = tgt_ids[:, 0]
 
         for t in range(1, tgt_len):
-            pred, dec_hidden, dec_cell, _ = self.decoder.forward_step(
-                dec_input, dec_hidden, dec_cell, encoder_outputs, src_mask
+            pred, dec_h, dec_c, _ = self.decoder.forward_step(
+                dec_input, dec_h, dec_c, enc_out, src_mask
             )
             outputs.append(pred)
-            if torch.rand(1).item() < teacher_forcing_ratio:
-                dec_input = tgt_ids[:, t]
-            else:
-                dec_input = pred.argmax(dim=-1)
+            use_tf    = torch.rand(1).item() < teacher_forcing_ratio
+            dec_input = tgt_ids[:, t] if use_tf else pred.argmax(dim=-1)
 
         return torch.stack(outputs, dim=1)
 
     def generate(self, src_ids, src_pos, src_lengths,
-                 max_len=config.MAX_SUMMARY_LEN, start_idx=2, end_idx=3):
-        """Greedy decoding for inference."""
+                 max_len=config.MAX_SUMMARY_LEN,
+                 start_idx=2, end_idx=3,
+                 block_unk=True,
+                 no_repeat_ngram=3):
+        """
+        Greedy decoding with:
+          block_unk=True      — never output PAD(0) or UNK(1)
+          no_repeat_ngram=3   — block any token seen in the last 3 positions
+                                to prevent "ഒരു ഒരു ഒരു..." repetition loops
+        """
         self.eval()
         with torch.no_grad():
             src_embedded = self.ptf_embed(src_ids, src_pos)
-            encoder_outputs, enc_hidden, enc_cell = self.encoder(src_embedded, src_lengths)
-            dec_hidden, dec_cell = self._init_decoder_state(enc_hidden, enc_cell)
-            src_mask = (src_ids == 0)
+            enc_out, enc_h, enc_c = self.encoder(src_embedded, src_lengths)
+            dec_h, dec_c = self._init_decoder_state(enc_h, enc_c)
+            src_mask     = self._make_src_mask(src_ids, enc_out.size(1))
 
-            batch_size = src_ids.size(0)
-            dec_input = torch.full((batch_size,), start_idx,
+            B         = src_ids.size(0)
+            dec_input = torch.full((B,), start_idx,
                                    dtype=torch.long, device=src_ids.device)
             generated = []
-            done = torch.zeros(batch_size, dtype=torch.bool, device=src_ids.device)
+            done      = torch.zeros(B, dtype=torch.bool, device=src_ids.device)
 
-            for _ in range(max_len):
-                pred, dec_hidden, dec_cell, _ = self.decoder.forward_step(
-                    dec_input, dec_hidden, dec_cell, encoder_outputs, src_mask
+            for step in range(max_len):
+                pred, dec_h, dec_c, _ = self.decoder.forward_step(
+                    dec_input, dec_h, dec_c, enc_out, src_mask
                 )
-                next_token = pred.argmax(dim=-1)
-                generated.append(next_token)
-                done |= (next_token == end_idx)
+
+                # Block PAD and UNK from being output
+                if block_unk:
+                    pred[:, 0] = float('-inf')
+                    pred[:, 1] = float('-inf')
+
+                # Repetition penalty: block tokens seen in last N positions
+                if no_repeat_ngram > 0 and step >= 1:
+                    recent = generated[-no_repeat_ngram:]   # list of (B,) tensors
+                    for prev_tok in recent:
+                        for b in range(B):
+                            pred[b, prev_tok[b].item()] = float('-inf')
+
+                next_tok = pred.argmax(dim=-1)
+                generated.append(next_tok)
+                done |= (next_tok == end_idx)
                 if done.all():
                     break
-                dec_input = next_token
+                dec_input = next_tok
 
         return torch.stack(generated, dim=1)
 
 
 def build_model(vocab_size, embedding_matrix, variant='ptf_attention'):
-    """
-    Factory: build one of the three paper variants.
-    variant: 'seq2seq' | 'attention' | 'ptf_attention'
-    """
     if variant not in config.MODEL_VARIANTS:
         raise ValueError(f"Unknown variant '{variant}'")
     flags = config.MODEL_VARIANTS[variant]
@@ -195,6 +197,6 @@ def build_model(vocab_size, embedding_matrix, variant='ptf_attention'):
         use_attention=flags['use_attention'],
         use_pos=flags['use_pos'],
     ).to(config.DEVICE)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model '{variant}' | params={n_params:,} | device={config.DEVICE}")
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model '{variant}' | params={n:,} | device={config.DEVICE}")
     return model

@@ -1,0 +1,4 @@
+.env/
+checkpoints/
+data/
+src/__pycache__/
