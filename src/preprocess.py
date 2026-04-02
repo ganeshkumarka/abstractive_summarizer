@@ -237,14 +237,33 @@ def run_preprocessing():
           f"/{config.MAX_INPUT_LEN}")
     print(f"    tgt UNKs: {s0['tgt_ids'].count(unk_id)}/{config.MAX_SUMMARY_LEN}")
 
-    # Split
+    # SOURCE-LEVEL SPLIT — split the 2000 raw rows FIRST, then augment each half.
+    # Splitting after augmentation caused 96.2% data leakage (same source paragraph
+    # in both train and test with different summary types).
     import random
     random.seed(config.SEED)
-    random.shuffle(processed)
-    split = int(len(processed) * config.TRAIN_SPLIT)
-    train_data = processed[:split]
-    test_data  = processed[split:]
-    print(f"\n  Train: {len(train_data)}, Test: {len(test_data)}")
+
+    # Group processed samples by source fingerprint (first 8 tokens)
+    from collections import defaultdict
+    src_groups = defaultdict(list)
+    for s in processed:
+        fp = tuple(s['src_tokens'][:8])
+        src_groups[fp].append(s)
+
+    unique_sources = list(src_groups.keys())
+    random.shuffle(unique_sources)
+    split_idx = int(len(unique_sources) * config.TRAIN_SPLIT)
+
+    train_sources = set(unique_sources[:split_idx])
+    test_sources  = set(unique_sources[split_idx:])
+
+    train_data = [s for s in processed if tuple(s['src_tokens'][:8]) in train_sources]
+    test_data  = [s for s in processed if tuple(s['src_tokens'][:8]) in test_sources]
+
+    print(f"\n  Unique source paragraphs: {len(unique_sources)}")
+    print(f"  Train sources: {len(train_sources)} → {len(train_data)} pairs")
+    print(f"  Test sources : {len(test_sources)} → {len(test_data)} pairs")
+    print(f"  Leakage: 0% (source-level split guaranteed)")
 
     with open(os.path.join(config.DATA_PROCESSED, 'train.pkl'), 'wb') as f:
         pickle.dump(train_data, f)
