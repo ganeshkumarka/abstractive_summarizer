@@ -15,6 +15,7 @@ def read_file_and_find_features(file_path):
         lines_read = file_read.readlines()
         features_string += find_features_from_sentences(lines_read)
         return features_string
+        
 
 
 def find_features_from_sentences(sentences):

@@ -103,6 +103,7 @@ we bootstrap a training set by:
   3. The CRF learns to generalise the suffix rules using sequence context
      (previous/next token features) → better accuracy than pure rule-based
 
+
 This is a standard bootstrapping approach in low-resource NLP.
 
 If you also have real annotated data (CoNLL file), pass it with --conll
