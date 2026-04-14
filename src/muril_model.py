@@ -379,6 +379,10 @@ class MuRILBiLSTMModel(nn.Module):
         dec_c = torch.tanh(self.enc2dec_c(enc_c))
 
         enc_len = enc_out.size(1)
+        pos_len = src_pos.size(1)
+        if self.use_muril and enc_len > pos_len:
+            enc_out = enc_out[:, :pos_len, :]
+            enc_len = pos_len
 
         if self.use_muril and muril_attn_mask is not None:
             # For MuRIL: src_mask comes from MuRIL attention mask (0=pad, 1=real)
@@ -388,7 +392,8 @@ class MuRILBiLSTMModel(nn.Module):
         else:
             src_mask = self._make_src_mask(src_ids, enc_len)
 
-        # POS for attention gate — trim to enc_len
+        # POS for attention gate — trim to min(enc_len, src_pos.size(1))
+        # enc_len from MuRIL can exceed MAX_INPUT_LEN (150) since MuRIL uses 256
         pos_trimmed = src_pos[:, :enc_len, :]
 
         outputs   = []
@@ -416,6 +421,14 @@ class MuRILBiLSTMModel(nn.Module):
             dec_h = torch.tanh(self.enc2dec_h(enc_h))
             dec_c = torch.tanh(self.enc2dec_c(enc_c))
             enc_len = enc_out.size(1)
+            pos_len = src_pos.size(1)
+            if self.use_muril and enc_len > pos_len:
+                enc_out = enc_out[:, :pos_len, :]
+                enc_len = pos_len
+            pos_len = src_pos.size(1)
+            if self.use_muril and enc_len > pos_len:
+                enc_out = enc_out[:, :pos_len, :]
+                enc_len = pos_len
             if self.use_muril and muril_attn_mask is not None:
                 muril_mask_trimmed = muril_attn_mask[:, :enc_len]
                 src_mask = (muril_mask_trimmed == 0)

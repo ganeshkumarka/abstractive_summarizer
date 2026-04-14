@@ -145,9 +145,13 @@ def train(variant='muril_bilstm_pos', batch_size=32):
     if use_muril:
         tokenizer = get_tokenizer()
         from src.muril_dataset import get_muril_dataloaders
+        # BiLSTM variants use more GPU memory — reduce seq len to avoid OOM on 4GB VRAM
+        use_bilstm = MURIL_VARIANTS[variant]['use_bilstm']
+        muril_max_len = 128  # use 128 for all MuRIL variants (4GB VRAM constraint)
         train_loader, test_loader = get_muril_dataloaders(
-            tokenizer, batch_size=batch_size, muril_max_len=256
+            tokenizer, batch_size=batch_size, muril_max_len=muril_max_len
         )
+        print(f"  muril_max_len={muril_max_len} (bilstm={use_bilstm})")
     else:
         matrix = load_embedding_matrix(
             os.path.join(config.DATA_EMBEDDINGS, 'embedding_matrix.npy'))

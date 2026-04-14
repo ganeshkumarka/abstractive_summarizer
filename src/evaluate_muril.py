@@ -29,23 +29,34 @@ def load_paper_model(variant, vocab_size, matrix):
     ckpt_path = os.path.join(config.CHECKPOINTS_DIR, f'best_{variant}.pt')
     if not os.path.exists(ckpt_path):
         return None, None
-    model = build_model(vocab_size, matrix, variant=variant)
-    ckpt  = torch.load(ckpt_path, map_location=config.DEVICE)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
-    return model, ckpt
+    try:
+        model = build_model(vocab_size, matrix, variant=variant)
+        model = model.cpu()
+        ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        return model, ckpt
+    except (OSError, RuntimeError) as e:
+        print(f"  Checkpoint error: {e}")
+        return None, None
 
 
 def load_muril_model(variant, vocab_size, matrix):
     ckpt_path = os.path.join(config.CHECKPOINTS_DIR, f'best_{variant}.pt')
     if not os.path.exists(ckpt_path):
         return None, None
-    model = build_muril_model(variant, vocab_size=vocab_size,
-                               embedding_matrix=matrix, freeze_muril=True)
-    ckpt  = torch.load(ckpt_path, map_location=config.DEVICE)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
-    return model, ckpt
+    try:
+        # Load to CPU first to avoid OOM when VRAM is fragmented
+        model = build_muril_model(variant, vocab_size=vocab_size,
+                                   embedding_matrix=matrix, freeze_muril=True)
+        model = model.cpu()
+        ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        return model, ckpt
+    except (OSError, RuntimeError) as e:
+        print(f"  Checkpoint error: {e}")
+        return None, None
 
 
 # ── Evaluation loops ───────────────────────────────────────────────────────────
@@ -159,10 +170,23 @@ def run_all_evaluation():
         for ex in examples[:1]:
             print(f"    REF: {ex['ref'][:60]}")
             print(f"    HYP: {ex['hyp'][:60]}")
+        del model
+        if device == 'cuda':
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
 
     # ── Proposed MuRIL variants ────────────────────────────────────────────────
     muril_order = ['word2vec_bilstm', 'muril_lstm',
                    'muril_bilstm', 'muril_bilstm_pos']
+
+    # Pre-load MuRIL tokenizer once (avoid repeated HF downloads per variant)
+    muril_tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+        muril_tokenizer = AutoTokenizer.from_pretrained('google/muril-base-cased')
+        print("MuRIL tokenizer loaded")
+    except Exception as e:
+        print(f"Could not load MuRIL tokenizer: {e}")
 
     print("\n=== Proposed MuRIL variants ===")
     for v in muril_order:
@@ -176,17 +200,15 @@ def run_all_evaluation():
         model = model.to(device)
 
         if use_muril:
-            if muril_test_loader is None:
-                try:
-                    from transformers import AutoTokenizer
-                    from src.muril_dataset import get_muril_dataloaders
-                    tok = AutoTokenizer.from_pretrained('google/muril-base-cased')
-                    _, muril_test_loader = get_muril_dataloaders(
-                        tok, batch_size=32, muril_max_len=128)
-                except Exception as e:
-                    print(f"  Could not load MuRIL loader: {e}")
-                    continue
-            loader = muril_test_loader
+            if muril_tokenizer is None:
+                print(f"  Skipping {v}: MuRIL tokenizer not available")
+                continue
+            try:
+                from src.muril_dataset import get_muril_dataloaders
+                _, loader = get_muril_dataloaders(muril_tokenizer, batch_size=32, muril_max_len=128)
+            except Exception as e:
+                print(f"  Could not load MuRIL loader: {e}")
+                continue
         else:
             loader = std_test_loader
 
@@ -198,6 +220,11 @@ def run_all_evaluation():
         for ex in examples[:1]:
             print(f"    REF: {ex['ref'][:60]}")
             print(f"    HYP: {ex['hyp'][:60]}")
+        # Free GPU memory before loading next model
+        del model
+        if device == 'cuda':
+            import gc; gc.collect()
+            torch.cuda.empty_cache()
 
     # ── Full comparison table ──────────────────────────────────────────────────
     print("\n" + "="*72)
